@@ -1,10 +1,9 @@
-# nnUNetCLS
+# nnClass
 
-nnUNetCLS is a Python-based project that extends the nnUNet framework with joint segmentation and classification capabilities. It combines the power of nnUNet's segmentation architecture with multi-class classification, making it ideal for medical imaging tasks that require both pixel-level segmentation and image-level classification predictions.
+nnClass is a Python-based project that extends the nnUNet framework  classification capabilities.
 
 ## Features
 
-- **Joint Architecture**: Simultaneous segmentation and classification in a single model
 - **Stratified Data Splitting**: Advanced data splitting with demographic stratification (age, gender)
 - **Multi-Modal Input**: Support for multi-channel medical images (CT, PET, MRI)
 - **Flexible Classification**: Support for both binary and multi-class classification tasks
