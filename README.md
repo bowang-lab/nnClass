@@ -14,7 +14,15 @@ nnClass is a Python-based project that extends the nnUNet framework  classificat
 To set up nnUNetCLS, first install the required dependencies:
 
 ```bash
+
+# Create and activate a new conda environment
+conda create -n nnclass python=3.12 -y
+conda activate nnclass
+
+# Install dependencies
 pip install wandb
+
+# Install the current project in editable mode
 pip install -e .
 ```
 
