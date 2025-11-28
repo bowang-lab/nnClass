@@ -71,6 +71,7 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerDA5 import nnUNetTrainerDA5
 from sklearn import metrics
+from torchmetrics.functional import auroc
 import wandb
 from monai.networks.nets import DenseNet121, SEResNet50, ViT, SwinUNETR, MedNeXt
 
@@ -146,6 +147,9 @@ class DynamicClassificationLoss(nn.Module):
                 targets = targets.unsqueeze(1)
             if targets.type() != logits.type():
                 targets = targets.type(logits.type())
+        else:
+            if targets.dim() > 1:
+                targets = targets.squeeze().long()
         return self.loss(logits, targets)
 
 
@@ -704,11 +708,11 @@ class nnUNetCLSTrainer(nnUNetTrainer):
         all_ids = outputs_collated['all_ids']
 
         if self.cls_class_num == 2:
-            auc_metric = metrics.roc_auc_score(all_labels, all_probs)
+            auc_metric = auroc(all_probs, all_labels, task="binary")
             classification_accuracy = metrics.accuracy_score(all_labels, all_preds)
             balanced_accuracy = metrics.balanced_accuracy_score(all_labels, all_preds)
         else:
-            auc_metric = metrics.multiclass.roc_auc_score(all_labels, all_probs, multi_class='ovr')
+            auc_metric = auroc(all_probs, all_labels, task="multiclass", num_classes=self.cls_class_num)
             classification_accuracy = metrics.accuracy_score(all_labels, all_preds)
             balanced_accuracy = metrics.balanced_accuracy_score(all_labels, all_preds)
 
@@ -804,7 +808,8 @@ class DenseNetTrainer(nnUNetCLSTrainer):
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True,
                                    emb_dim: int = 256,
-                                   cls_class_num: int = 1) -> nn.Module:
+                                   cls_class_num: int = 1,
+                                   patch_size=None) -> nn.Module:
 
         
 
