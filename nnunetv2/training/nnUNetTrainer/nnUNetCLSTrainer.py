@@ -671,7 +671,7 @@ class nnUNetCLSTrainer(nnUNetTrainer):
         
         
         if self.cls_class_num == 2:
-            class_probs = torch.sigmoid(cls_output)  # Assuming cls_output is logits
+            class_probs = torch.sigmoid(cls_output).squeeze(-1)  # Assuming cls_output is logits
             predicted_class = (class_probs > 0.5).float()  # Thresholding at 0.5 for binary classification
         else:
             class_probs = torch.softmax(cls_output, dim=1)
