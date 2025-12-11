@@ -18,85 +18,14 @@ from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
-from nnunetv2.preprocessing.resampling.default_resampling import fast_resample_logit_to_shape
-from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
 from tqdm import tqdm
 import argparse
-import glob
 import os
-import gc
 import pandas as pd
-from sklearn.metrics import roc_auc_score, roc_curve
-import json
 from tqdm import tqdm
 import re
 from collections import defaultdict
 
-def logit_to_segment(predicted_logits):
-    max_logit, max_class = torch.max(predicted_logits, dim=0)
-                
-                # Apply threshold: Only assign the class if its logit exceeds the threshold
-    segmentation = torch.where(max_logit >= 0.5, max_class, torch.tensor(0, device=predicted_logits.device))
-
-    return segmentation
-
-def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits: Union[torch.Tensor, np.ndarray],
-                                                                plans_manager: PlansManager,
-                                                                configuration_manager: ConfigurationManager,
-                                                                label_manager: LabelManager,
-                                                                properties_dict: dict,
-                                                                use_softmax,
-                                                                return_probabilities: bool = False,
-                                                                ):
-
-    # resample to original shape
-    spacing_transposed = [properties_dict['spacing'][i] for i in plans_manager.transpose_forward]
-    current_spacing = configuration_manager.spacing if \
-        len(configuration_manager.spacing) == \
-        len(properties_dict['shape_after_cropping_and_before_resampling']) else \
-        [spacing_transposed[0], *configuration_manager.spacing]
-
-
-
-    # apply_inference_nonlin will convert to torch
-    if properties_dict['shape_after_cropping_and_before_resampling'][0] < 600:
-        predicted_logits = fast_resample_logit_to_shape(predicted_logits,
-                                            properties_dict['shape_after_cropping_and_before_resampling'],
-                                            current_spacing,
-                                            [properties_dict['spacing'][i] for i in plans_manager.transpose_forward])
-        gc.collect()
-        empty_cache(predicted_logits.device)
-        if use_softmax:
-            predicted_probabilities = label_manager.apply_inference_nonlin(predicted_logits)
-
-            del predicted_logits
-            
-            # Start timing for converting probabilities to segmentation
-            segmentation = label_manager.convert_probabilities_to_segmentation(predicted_probabilities)
-        else:
-            # Get the class with the maximum logit at each pixel
-            segmentation = logit_to_segment(predicted_logits)
-
-    else:
-        print(f"Predicted Logits: {predicted_logits.shape}")
-        segmentation = fast_resample_logit_to_shape(predicted_logits,
-                                            properties_dict['shape_after_cropping_and_before_resampling'],
-                                            current_spacing,
-                                            [properties_dict['spacing'][i] for i in plans_manager.transpose_forward])
-
-
-
-    dtype = torch.uint8 if len(label_manager.foreground_labels) < 255 else torch.uint16
-    segmentation_reverted_cropping = torch.zeros(properties_dict['shape_before_cropping'], dtype=dtype)
-    slicer = bounding_box_to_slice(properties_dict['bbox_used_for_cropping'])
-    segmentation_reverted_cropping[slicer] = segmentation
-
-    del segmentation
-
-    # Revert transpose
-    segmentation_reverted_cropping = segmentation_reverted_cropping.permute(plans_manager.transpose_backward)
-
-    return segmentation_reverted_cropping.cpu()
 
 class SimplePredictor(nnUNetPredictor):
     """
@@ -131,7 +60,7 @@ class SimplePredictor(nnUNetPredictor):
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
             ckpt = checkpoint['network_weights']
             ckpt = {k.replace('module.', ''): v for k, v in ckpt.items()}
-            num_classes = ckpt['classifier.3.weight'].shape[0]
+            num_classes = checkpoint['cls_class_num']
             parameters.append(ckpt)
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
@@ -191,7 +120,7 @@ class SimplePredictor(nnUNetPredictor):
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction, cls_prediction = self.network(x)
+        cls_prediction = self.network(x)
 
         if mirror_axes is not None:
             # check for invalid numbers in mirror_axes
@@ -203,19 +132,17 @@ class SimplePredictor(nnUNetPredictor):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction_flipped, cls_prediction_flipped = self.network(torch.flip(x, axes))
-                prediction += torch.flip(prediction_flipped, axes)
+                cls_prediction_flipped = self.network(torch.flip(x, axes))
                 cls_prediction += cls_prediction_flipped
-            prediction /= (len(axes_combinations) + 1)
             cls_prediction /= (len(axes_combinations) + 1)
-        return prediction, cls_prediction
+        return cls_prediction
     @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(self,
                                                        data: torch.Tensor,
                                                        slicers,
                                                        do_on_device: bool = True,
                                                        ):
-        predicted_logits = n_predictions = prediction = gaussian = workon = None
+        workon = None
         class_logits = None
         results_device = self.device if do_on_device else torch.device('cpu')
         self.network = self.network.to(self.device)
@@ -231,19 +158,9 @@ class SimplePredictor(nnUNetPredictor):
             # preallocate arrays
             if self.verbose:
                 print(f'preallocating results arrays on device {results_device}')
-            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
-                                           dtype=torch.half,
-                                           device=results_device)
-            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
-            # TODO: The shape should be number of classes
+
             class_logits = torch.zeros((self.num_classes), dtype=torch.half, device=results_device)
 
-            if self.use_gaussian:
-                gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
-                                            value_scaling_factor=10,
-                                            device=results_device)
-            else:
-                gaussian = 1
 
             if not self.allow_tqdm and self.verbose:
                 print(f'running prediction: {len(slicers)} steps')
@@ -252,37 +169,21 @@ class SimplePredictor(nnUNetPredictor):
                 workon = data[sl][None]
                 workon = workon.to(self.device)
 
-                prediction, class_logits_patch = self._internal_maybe_mirror_and_predict(workon)
-                prediction = prediction[0].to(results_device)
+                class_logits_patch = self._internal_maybe_mirror_and_predict(workon)
                 class_logits_patch = class_logits_patch[0].to(results_device)
 
-                if self.use_gaussian:
-                    prediction *= gaussian
-                predicted_logits[sl] += prediction
-                n_predictions[sl[1:]] += gaussian
+                class_logits += class_logits_patch
+                cls_slices += 1
 
-                if self.cls_mode == 'mean':
-                    class_logits += class_logits_patch
-                    cls_slices += 1
-                else:
-                    if prediction.max() > 0.5:
-                        class_logits += class_logits_patch
-                        cls_slices += 1
             print(f'Number of slices used for classification: {cls_slices}')
-            predicted_logits /= n_predictions
             class_logits /= cls_slices
-            # check for infs
-            if torch.any(torch.isinf(predicted_logits)):
-                raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
-                                   'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
-                                   'predicted_logits to fp32')
         except Exception as e:
-            del predicted_logits, n_predictions, prediction, gaussian, workon
             del class_logits
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
-        return predicted_logits, class_logits
+
+        return class_logits
     
 
     def inference(self, image, properties_dict, use_softmax):
@@ -307,18 +208,17 @@ class SimplePredictor(nnUNetPredictor):
                     else:
                         self.network._orig_mod.load_state_dict(params)
                     if predicted_logits is None:
-                        predicted_logits, cls_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                        cls_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                     self.perform_everything_on_device)
                         if self.num_classes == 1:
-                            predicted_logits, cls_logits = predicted_logits.to('cpu'), torch.sigmoid(cls_logits).cpu()
-                            print(torch.sigmoid(cls_logits).cpu())
+                            cls_logits = torch.sigmoid(cls_logits).cpu()
+                            print(cls_logits)
                         else:    
-                            predicted_logits, cls_logits = predicted_logits.to('cpu'), cls_logits.to('cpu')
+                            cls_logits = cls_logits.to('cpu')
                         
                     else:
-                        cur_prediction, cur_class_logit = self._internal_predict_sliding_window_return_logits(data, slicers,
+                        cur_class_logit = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                     self.perform_everything_on_device)
-                        predicted_logits += cur_prediction.to('cpu')
                         if self.num_classes == 1:
                             cls_logits += torch.sigmoid(cur_class_logit).cpu()
                             print(torch.sigmoid(cur_class_logit).cpu())
@@ -326,19 +226,9 @@ class SimplePredictor(nnUNetPredictor):
                             cls_logits += cur_class_logit.to('cpu')
 
                 if len(self.list_of_parameters) > 1:
-                    predicted_logits /= len(self.list_of_parameters)
                     cls_logits /= len(self.list_of_parameters)
                 empty_cache(self.device) # Start time for inference time calculation
-                predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
 
-                segmentation = convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits,
-                                                                self.plans_manager,
-                                                                self.configuration_manager,
-                                                                self.label_manager,
-                                                                properties_dict,
-                                                                use_softmax,
-                                                                return_probabilities=False,
-                                                                )
 
 
         if self.num_classes > 1:
@@ -346,7 +236,7 @@ class SimplePredictor(nnUNetPredictor):
         else:
             cls_probs = cls_logits
 
-        return segmentation, cls_probs
+        return cls_probs
 
 def group_images_by_idx(input_folder):
     pattern = re.compile(r"^(.*)_000\d+\.nii\.gz$")  # Captures everything before the _000x
@@ -417,12 +307,7 @@ if __name__ == "__main__":
         case_path = cases_dict[case]
         test_ids.append(case)
         image, props = SimpleITKIO().read_images(case_path)
-        segmentation, cls_probs = predictor.inference(image, props, args.use_softmax)
-        sitk_img = sitk.GetImageFromArray(segmentation)
-        sitk_img.SetSpacing(props['sitk_stuff']['spacing'])
-        sitk_img.SetOrigin(props['sitk_stuff']['origin'])
-        sitk_img.SetDirection(props['sitk_stuff']['direction'])
-        #sitk.WriteImage(sitk_img, segmentation_path)
+        cls_probs = predictor.inference(image, props, args.use_softmax)
         test_probs.append(cls_probs.tolist())
     
     results = pd.DataFrame({'identifier': test_ids, 'probs': test_probs})

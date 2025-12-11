@@ -412,7 +412,7 @@ class nnUNetCLSTrainer(nnUNetTrainer):
                                                                    self.dataset_json)
 
             self.cls_class_num = self.get_cls_class_num(join(self.preprocessed_dataset_folder, os.pardir, 'cls_data.csv'))
-            cls_head_output = self.cls_class_num if self.cls_class_num > 2 else 1
+            self.cls_head_output = self.cls_class_num if self.cls_class_num > 2 else 1
             self.network = self.build_network_architecture(
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
@@ -421,7 +421,7 @@ class nnUNetCLSTrainer(nnUNetTrainer):
                 self.label_manager.num_segmentation_heads,
                 self.enable_deep_supervision,
                 self.configuration_manager.network_arch_init_kwargs['features_per_stage'][-1],
-                cls_head_output,
+                self.cls_head_output,
                 self.configuration_manager.patch_size
             ).to(self.device)
             # compile network for free speedup
@@ -772,6 +772,33 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             self.logger.plot_progress_png(self.output_folder)
 
         self.current_epoch += 1
+
+    def save_checkpoint(self, filename: str) -> None:
+        if self.local_rank == 0:
+            if not self.disable_checkpointing:
+                if self.is_ddp:
+                    mod = self.network.module
+                else:
+                    mod = self.network
+                if isinstance(mod, OptimizedModule):
+                    mod = mod._orig_mod
+
+                checkpoint = {
+                    'network_weights': mod.state_dict(),
+                    'optimizer_state': self.optimizer.state_dict(),
+                    'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    'logging': self.logger.get_checkpoint(),
+                    '_best_ema': self._best_ema,
+                    'current_epoch': self.current_epoch + 1,
+                    'init_args': self.my_init_kwargs,
+                    'trainer_name': self.__class__.__name__,
+                    'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+                    'cls_class_num': self.cls_head_output,
+                }
+                torch.save(checkpoint, filename)
+            else:
+                self.print_to_log_file('No checkpoint written, checkpointing is disabled')
+    
     def run_training(self):
         self.on_train_start()
 
@@ -877,7 +904,7 @@ class SwinViTTrainer(nnUNetCLSTrainer):
                                                                    self.dataset_json)
 
             self.cls_class_num = self.get_cls_class_num(join(self.preprocessed_dataset_folder, os.pardir, 'cls_data.csv'))
-            cls_head_output = self.cls_class_num if self.cls_class_num > 2 else 1
+            self.cls_head_output = self.cls_class_num if self.cls_class_num > 2 else 1
             self.network = self.build_network_architecture(
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
@@ -886,7 +913,7 @@ class SwinViTTrainer(nnUNetCLSTrainer):
                 self.label_manager.num_segmentation_heads,
                 self.enable_deep_supervision,
                 self.configuration_manager.network_arch_init_kwargs['features_per_stage'][-1],
-                cls_head_output,
+                self.cls_head_output,
                 self.configuration_manager.patch_size
             ).to(self.device)
             # compile network for free speedup
